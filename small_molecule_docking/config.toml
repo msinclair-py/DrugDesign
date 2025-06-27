@@ -1,0 +1,14 @@
+[directories]
+receptors = 'receptors'
+pdbs = 'pdbs'
+scores = 'scores'
+poses = 'poses'
+temp = 'temp'
+
+[settings]
+smiles = 'compounds/smiles.txt'
+max_confs = 1
+batch_size = 16
+pose_gen = true
+score_pattern = 'scores'
+score_cutoff = 0
