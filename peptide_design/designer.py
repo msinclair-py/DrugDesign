@@ -2,8 +2,10 @@ from Bio import PDB
 from chroma import Chroma, Protein, conditioners
 import MDAnalysis as mda
 import numpy as np
+import os
 from pathlib import Path
 import pip._vendor.tomli as tomllib
+import shutil
 import torch
 from typing import Union, Type, TypeVar
 
@@ -27,7 +29,9 @@ class ChromaDesigner:
                  model_weights: PathLike,
                  backbone_weights: PathLike,
                  conditioner_weights: PathLike,
-                 device: str):
+                 device: str,
+                 store_in_memory: bool=False,
+                 memory_migration_freq: int=5):
         self.input_dir = Path(input_dir) if isinstance(input_dir, str) else input_dir
         self.output_dir = Path(output_dir) if isinstance(output_dir, str) else output_dir
         self.hotspot_dir = Path(hotspot_dir) if isinstance(hotspot_dir, str) else hotspot_dir
@@ -45,9 +49,10 @@ class ChromaDesigner:
         self.bb_weights = backbone_weights
         self.conditioner_weights = conditioner_weights
         self.device = device
+        self.store_in_memory = store_in_memory
+        self.mem_freq = memory_migration_freq
 
         self.model = self.load_model()
-
 
     def run_rounds(self):
         """
@@ -68,12 +73,17 @@ class ChromaDesigner:
                 protein, mask_aa = self.prepare_protein(pdb, len_binder)
                 conditioner_list = self.generate_conditioners(protein, vector, magnitude)
                 conditioner = conditioners.ComposedConditioner(conditioner_list)
+                print(protein)
                 proteins, trajectories = self.design(protein, conditioner, mask_aa)
                 self.save(proteins, f'round_{i}', pdb.stem)
 
                 i += 1
 
-            except RuntimeError: # avoid Intel oneMKL Errors and such
+                if self.store_in_memory and i % self.mem_freq == 0:
+                    self.dump_from_memory()
+
+            except RuntimeError as e: # avoid Intel oneMKL Errors and such
+                print(e)
                 continue
 
     def design(self,
@@ -116,6 +126,13 @@ class ChromaDesigner:
         """
         path = self.output_dir / _round
         path.mkdir(exist_ok=True, parents=True)
+        
+        if self.store_in_memory:
+            if not hasattr(self, 'mem_path'):
+                self.mem_path = Path('/dev/shm') / self.output_dir.name
+
+            path = self.mem_path / _round
+            path.mkdir(exist_ok=True, parents=True)
 
         if not isinstance(proteins, list):
             proteins = [proteins]
@@ -131,6 +148,17 @@ class ChromaDesigner:
             self.convert_cif_to_pdb(output)
 
             output.unlink(missing_ok=True)
+
+    def dump_from_memory(self):
+        outbound = self.mem_path.glob('round_*')
+        inbound = self.output_dir
+        
+        for directory in outbound:
+            files = directory.glob('*')
+            for file in files:
+                if not (in_file := (inbound / directory.name / file.name).resolve()).exists():
+                    shutil.copy2(str(file), str(in_file))
+                    os.remove(str(file))
 
     def load_model(self) -> Chroma:
         """
@@ -315,6 +343,8 @@ class ChromaDesigner:
         n_backbones = config['num_backbones']
         n_designs = config['num_designs']
         diff_steps = config['diffusion_steps']
+        store_in_memory = config['store_in_memory']
+        memory_migration_freq = config['memory_migration_freq']
 
         model_weights = nn['design_weights']
         backbone_weights = nn['bb_weights']
@@ -333,5 +363,7 @@ class ChromaDesigner:
                    model_weights,
                    backbone_weights,
                    conditioner_weights,
-                   device
+                   device,
+                   store_in_memory,
+                   memory_migration_freq,
                   )
