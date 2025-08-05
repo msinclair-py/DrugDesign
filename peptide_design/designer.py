@@ -37,7 +37,10 @@ class ChromaDesigner:
         self.output_dir = Path(output_dir) if isinstance(output_dir, str) else output_dir
         self.hotspot_dir = Path(hotspot_dir) if isinstance(hotspot_dir, str) else hotspot_dir
         
-        self.pdbs = list(self.input_dir.glob('*.pdb'))
+        if self.input_dir.suffix == '.pdb':
+            self.pdbs = [self.input_dir]
+        else:
+            self.pdbs = list(self.input_dir.glob('*.pdb'))
 
         self.hotspots = hotspots
         self.binder_len = [x for x in range(*binder_length)]
