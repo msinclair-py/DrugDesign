@@ -20,8 +20,8 @@ class ChromaDesigner:
     def __init__(self,
                  input_dir: PathLike,
                  output_dir: PathLike,
-                 hotspot_dir: OptPath,
                  hotspots: list[ConfigOption],
+                 fold_classification: ConfigOption,
                  binder_length: list[int],
                  n_rounds: int,
                  n_backbones: int,
@@ -35,7 +35,6 @@ class ChromaDesigner:
                  memory_migration_freq: int=1):
         self.input_dir = Path(input_dir) if isinstance(input_dir, str) else input_dir
         self.output_dir = Path(output_dir) if isinstance(output_dir, str) else output_dir
-        self.hotspot_dir = Path(hotspot_dir) if isinstance(hotspot_dir, str) else hotspot_dir
         
         if self.input_dir.suffix == '.pdb':
             self.pdbs = [self.input_dir]
@@ -43,6 +42,7 @@ class ChromaDesigner:
             self.pdbs = list(self.input_dir.glob('*.pdb'))
 
         self.hotspots = hotspots
+        self.fold = fold_classification
         self.binder_len = [x for x in range(*binder_length)]
         self.n_rounds = n_rounds
         self.n_bbs = n_backbones
@@ -70,18 +70,21 @@ class ChromaDesigner:
         while i < self.n_rounds:
             try:
                 print(f'round_{i}')
-                pdb, len_binder, hotspot, scaling = self.choose_inputs()
+                pdb, len_binder, hotspot, scaling, fold = self.choose_inputs()
                 vector, magnitude = self.prepare_inflate_conditioner(pdb, 
                                                                      hotspot,
                                                                      scaling)
 
                 protein, mask_aa = self.prepare_protein(pdb, len_binder)
-                conditioner_list = self.generate_conditioners(protein, vector, magnitude)
+                conditioner_list = self.generate_conditioners(protein, vector, magnitude, fold)
                 conditioner = conditioners.ComposedConditioner(conditioner_list)
                 proteins, trajectories = self.design(protein, conditioner, mask_aa)
                 metadata = {'backbones': self.n_bbs, 'designs': self.N, 'pdb': pdb.stem, 'hotspot': hotspot}
-                self.save_metadata(metadata, f'round_{i}')
+                
                 self.save(proteins, f'round_{i}', pdb.stem)
+                self.save_metadata(metadata, f'round_{i}')
+
+                # do MPNN
 
                 i += 1
 
@@ -148,13 +151,13 @@ class ChromaDesigner:
 
             path = self.mem_path / _round
             path.mkdir(exist_ok=True, parents=True)
-
+        
         if not isinstance(proteins, list):
             proteins = [proteins]
 
         if isinstance(proteins[0], list):
-            proteins = proteins[0]
-
+            proteins = [x for row in proteins for x in row]
+        
         for i, protein in enumerate(proteins):
             backbone = f'backbone{i // self.N}'
             design = f'design{i % self.N}'
@@ -188,26 +191,16 @@ class ChromaDesigner:
     def choose_inputs(self) -> tuple[PathLike, int, str, float]:
         pdb = self.choose_pdb()
         length = self.choose_binder_length()
+        hotspot_residues, scaling = self.choose_hotspot()
+        fold = self.choose_fold()
 
-        if self.hotspot_dir is not None:
-            hotspot_residues = self.choose_hotspot_from_dir(pdb.stem)
-            scaling = 1.1 # default, maybe ingest this into the class attributes
-        else:
-            hotspot_residues, scaling = self.choose_hotspot()
-
-        return pdb, length, hotspot_residues, scaling
+        return pdb, length, hotspot_residues, scaling, fold
 
     def choose_pdb(self) -> PathLike:
         return np.random.choice(self.pdbs, 1)[0]
 
     def choose_binder_length(self) -> int:
         return np.random.choice(self.binder_len, 1)[0]
-
-    def choose_hotspot_from_dir(self,
-                                name: str) -> str:
-        hotspots = self.hotspot_dir.glob(f'{name}_hspot*.txt')
-        hotspot_file = np.random_choice(hotspots, 1)[0]
-        return open(hotspot_file).readline().strip()
 
     def choose_hotspot(self) -> tuple[str, float]:
         keys = list(self.hotspots.keys())
@@ -226,6 +219,14 @@ class ChromaDesigner:
         scaling = hotspot['vector_scaling']
 
         return (' '.join([str(x) for x in hotspot_residues]), scaling)
+
+    def choose_fold(self) -> dict[str, str] | None:
+        if self.fold is None:
+            return None
+
+        folds = self.fold['types']
+        fold_index = np.random.choice(len(folds))
+        return folds[fold_index]
 
     def prepare_inflate_conditioner(self,
                                     pdb: PathLike,
@@ -275,7 +276,7 @@ class ChromaDesigner:
             ],
             dim=1
         )
-
+        
         del X, C, S
 
         protein = Protein(X_new, C_new, S_new, device=self.device)
@@ -302,7 +303,8 @@ class ChromaDesigner:
     def generate_conditioners(self,
                               protein: Protein,
                               vector: torch.Tensor,
-                              magnitude: float) -> list[Conditioner]:
+                              magnitude: float,
+                              fold: dict[str, str] | None) -> list[Conditioner]:
         """
         Combines substructure conditioning with the inflate conditioner to both
         remodel binder backbones and place them at a hotspot defined by the vector
@@ -317,7 +319,16 @@ class ChromaDesigner:
 
         displacement = conditioners.InflateConditioner(vector, magnitude).to(self.device)
         
-        return [displacement, substructure]
+        conditioner_list = [displacement, substructure]
+
+        # ProCapConditioner is currently bugged, also fine-tuned GPT-Neo not available
+        # from GenerateBio so out of luck there
+        #if fold is not None:
+        #    caption = f'crystal structure of {fold} fold'
+        #    procap = conditioners.ProCapConditioner(caption, chain_id=2)
+        #    conditioner_list.append(procap)
+        
+        return conditioner_list
 
     @staticmethod
     def convert_cif_to_pdb(cif: PathLike) -> None:
@@ -336,15 +347,16 @@ class ChromaDesigner:
                   config: PathLike) -> _T:
         config = tomllib.load(open(config, 'rb'))
         hotspots = config['hotspots']
+        try:
+            fold_class = config['fold_classification']
+        except KeyError:
+            fold_class = None
+
         nn = config['neural_net']
 
         config = config['settings']
         input_dir = Path(config['input_path'])
         output_dir = Path(config['output_path'])
-        try:
-            hotspot_dir = Path(config['hotspot_path'])
-        except KeyError:
-            hotspot_dir = None
         
         binder_length = config['binder_length']
 
@@ -362,8 +374,8 @@ class ChromaDesigner:
 
         return cls(input_dir,
                    output_dir,
-                   hotspot_dir,
                    hotspots,
+                   fold_class,
                    binder_length,
                    n_rounds,
                    n_backbones,
@@ -381,8 +393,8 @@ class SubseqDesigner(ChromaDesigner):
     def __init__(self,
                  input_dir: PathLike,
                  output_dir: PathLike,
-                 hotspot_dir: OptPath,
                  hotspots: list[ConfigOption],
+                 fold_classification: ConfigOption,
                  sequences: list[ConfigOption],
                  binder_length: list[int],
                  n_rounds: int,
@@ -398,8 +410,8 @@ class SubseqDesigner(ChromaDesigner):
         super().__init__(
             input_dir, 
             output_dir, 
-            hotspot_dir, 
             hotspots, 
+            fold_classification,
             binder_length, 
             n_rounds, 
             n_backbones, 
@@ -435,6 +447,7 @@ class SubseqDesigner(ChromaDesigner):
                 protein, mask_aa = self.prepare_protein(pdb, sequence, binder_mask)
                 
                 conditioner_list = self.generate_conditioners(protein, vector, magnitude)
+                conditioner_list.append(self.generate_subseq_conditioner(protein))
                 conditioner = conditioners.ComposedConditioner(conditioner_list)
                 
                 proteins, trajectories = self.design(protein, conditioner, mask_aa)
@@ -447,8 +460,8 @@ class SubseqDesigner(ChromaDesigner):
                     'subsequence': seq_str,
                 }
                 
-                self.save_metadata(metadata, f'round_{i}')
                 self.save(proteins, f'round_{i}', pdb.stem)
+                self.save_metadata(metadata, f'round_{i}')
 
                 i += 1
 
@@ -462,12 +475,7 @@ class SubseqDesigner(ChromaDesigner):
     def choose_inputs(self) -> tuple[PathLike, torch.Tensor, list[int], float, list[int], list[str]]:
         pdb = self.choose_pdb()
         length = self.choose_binder_length()
-
-        if self.hotspot_dir is not None:
-            hotspot_residues = self.choose_hotspot_from_dir(pdb.stem)
-            scaling = 1.1 # default, maybe ingest this into the class attributes
-        else:
-            hotspot_residues, scaling = self.choose_hotspot()
+        hotspot_residues, scaling = self.choose_hotspot()
 
         sequence = self.choose_subsequence()
         sequence_tensor, binder_mask = self.get_binder_tensor(sequence, length)
@@ -503,24 +511,10 @@ class SubseqDesigner(ChromaDesigner):
         binder, mask = self.reconstruct_binder_sequence(subseq, positions, start, length)
         return binder, mask
     
-    def generate_conditioners(self,
-                              protein: Protein,
-                              vector: torch.Tensor,
-                              magnitude: float) -> list[Conditioner]:
+    def generate_subseq_conditioner(self,
+                                    protein: Protein) -> Conditioner:
         """
-        Combines substructure conditioning with the inflate conditioner to both
-        remodel binder backbones and place them at a hotspot defined by the vector
-        fed to inflate. Returns composed chroma conditioner object.
         """
-
-        substructure = conditioners.SubstructureConditioner(
-            protein = protein,
-            backbone_model = self.model.backbone_network,
-            selection = 'namesel receptor'
-        ).to(self.device)
-
-        displacement = conditioners.InflateConditioner(vector, magnitude).to(self.device)
-        
         subsequence = conditioners.SubsequenceConditioner(
             design_model = self.model.design_network,
             protein = protein,
@@ -528,7 +522,7 @@ class SubseqDesigner(ChromaDesigner):
             n_backbones = self.n_bbs,
         ).to(self.device)
         
-        return [displacement, subsequence, substructure]
+        return subsequence
 
     def sample_start_index(self,
                            subseq_length: int,
@@ -626,16 +620,18 @@ class SubseqDesigner(ChromaDesigner):
                   config: PathLike) -> _T:
         config = tomllib.load(open(config, 'rb'))
         hotspots = config['hotspots']
+
+        try:
+            fold_class = config['fold_classification']
+        except KeyError:
+            fold_class = None
+
         sequences = config['sequences']
         nn = config['neural_net']
 
         config = config['settings']
         input_dir = Path(config['input_path'])
         output_dir = Path(config['output_path'])
-        try:
-            hotspot_dir = Path(config['hotspot_path'])
-        except KeyError:
-            hotspot_dir = None
         
         binder_length = config['binder_length']
 
@@ -653,8 +649,8 @@ class SubseqDesigner(ChromaDesigner):
 
         return cls(input_dir,
                    output_dir,
-                   hotspot_dir,
                    hotspots,
+                   fold_class,
                    sequences,
                    binder_length,
                    n_rounds,
@@ -669,4 +665,188 @@ class SubseqDesigner(ChromaDesigner):
                    memory_migration_freq,
                   )
 
+class ScaffoldDesigner(SubseqDesigner):
+    def __init__(self,
+                 input_dir: PathLike,
+                 output_dir: PathLike,
+                 hotspots: list[ConfigOption],
+                 fold_classification: ConfigOption,
+                 sequences: list[ConfigOption],
+                 binder_length: list[int],
+                 n_rounds: int,
+                 n_backbones: int,
+                 n_designs: int,
+                 diff_steps: int,
+                 model_weights: PathLike,
+                 backbone_weights: PathLike,
+                 conditioner_weights: PathLike,
+                 device: str,
+                 store_in_memory: bool=False,
+                 memory_migration_freq: int=1):
+        super().__init__(
+            input_dir, 
+            output_dir, 
+            hotspots, 
+            fold_classification,
+            sequences,
+            binder_length, 
+            n_rounds, 
+            n_backbones, 
+            n_designs, 
+            diff_steps, 
+            model_weights, 
+            backbone_weights, 
+            conditioner_weights, 
+            device, 
+            store_in_memory, 
+            memory_migration_freq
+        )
 
+    def run_rounds(self):
+        """
+        Main logic for running rounds of Chroma sampling.
+        """
+        # make output dir after __init__ incase we are appending
+        # parallel runs on the fly
+        self.output_dir.mkdir(exist_ok=True, parents=True)
+
+        i = 0
+        while i < self.n_rounds:
+            try:
+                print(f'round_{i}')
+                pdb, sequence, hotspot, scaling, binder_mask, seq_str, start = self.choose_inputs()
+                vector, magnitude = self.prepare_inflate_conditioner(pdb, 
+                                                                     hotspot,
+                                                                     scaling)
+
+                protein, mask_aa = self.prepare_protein(pdb, sequence, start, binder_mask)
+                
+                conditioner_list = self.generate_conditioners(protein, vector, magnitude)
+                conditioner_list.append(self.generate_subseq_conditioner(protein))
+                conditioner = conditioners.ComposedConditioner(conditioner_list)
+                
+                proteins, trajectories = self.design(protein, conditioner, mask_aa)
+
+                metadata = {
+                    'backbones': self.n_bbs, 
+                    'designs': self.N, 
+                    'pdb': pdb.stem, 
+                    'hotspot': hotspot, 
+                    'subsequence': seq_str,
+                }
+                
+                self.save(proteins, f'round_{i}', pdb.stem)
+                self.save_metadata(metadata, f'round_{i}')
+
+                i += 1
+
+                if self.store_in_memory and i % self.mem_freq == 0:
+                    self.dump_from_memory()
+
+            except RuntimeError as e: # avoid Intel oneMKL Errors and such
+                print(e)
+                continue
+    
+    def choose_inputs(self) -> tuple[PathLike, torch.Tensor, list[int], float, list[int], list[str], int]:
+        pdb = self.choose_pdb()
+        length = self.choose_binder_length()
+        hotspot_residues, scaling = self.choose_hotspot()
+
+        sequence = self.choose_subsequence()
+        sequence_tensor, binder_mask, start = self.get_binder_tensor(sequence, length)
+
+        return pdb, sequence_tensor, hotspot_residues, scaling, binder_mask, sequence, start
+
+    def get_binder_tensor(self,
+                          sequence: ConfigOption,
+                          binder_length: int) -> tuple[torch.Tensor, list[int]]:
+        subseq = sequence['sequence']
+        if isinstance(subseq, list):
+            positions = sequence['positions']
+            subseq_length = len(subseq[-1]) + positions[-1]
+        else:
+            positions = [0]
+            subseq = [subseq]
+            subseq_length = len(sequence['sequence'])
+
+        nterm, cterm = sequence['terminus_padding']
+
+        start, length = self.sample_start_index(subseq_length,
+                                                nterm,
+                                                cterm,
+                                                binder_length)
+
+        binder, mask = self.reconstruct_binder_sequence(subseq, positions, start, length)
+        return binder, mask, start
+
+    def prepare_protein(self,
+                        pdb: PathLike,
+                        sequence: torch.Tensor,
+                        start_position: int,
+                        binder_mask: list[int]) -> tuple[Protein, torch.Tensor]:
+        """
+        Adds to the input protein tensors to accomodate a binder of length 
+        `len_binder`. Returns protein object and masking tensor.
+        """
+        protein = Protein(str(pdb), device=self.device)
+        X, C, S = protein.to_XCS()
+
+        binder_mask = [1 for _ in range(X.shape[1])] + binder_mask
+        len_binder = sequence.shape[1]
+        
+        # identify length of original binder
+        L_receptor = (C == 1).sum().item()
+        L_original = (C == 2).sum().item()
+        
+        # get indices of the unpadded original sequence in the new designed sequence
+        original_peptide_start = L_receptor + start_position
+        original_peptide_end = original_peptide_start + L_original
+       
+        X_new = torch.cat(
+            [X[:, :L_receptor, ...],
+             torch.zeros(1, len_binder, 4, 3).xpu(),
+            ],
+            dim=1
+        )
+
+        for i, j in zip(range(orignal_peptide_start, original_peptide_end), range(L_receptor, X.shape[1])):
+            X_new[:, i, ...] = X[:, j, ...]
+
+        C_new = torch.cat(
+            [C[:, :L_receptor, ...],
+             torch.full((1, len_binder), 2).xpu()
+            ],
+            dim=1
+        )
+
+        S_new = torch.cat(
+            [S[:, :L_receptor, ...],
+             sequence,
+            ],
+            dim=1
+        )
+        
+        del X, C, S
+
+        protein = Protein(X_new, C_new, S_new, device=self.device)
+        X, C, S = protein.to_XCS()
+
+        L_binder = (C == 2).sum().item()
+        L_complex = L_binder + L_receptor
+        assert L_complex == C.shape[-1] # something terrible went wrong
+
+        mask_aa = torch.Tensor(L_complex * [[0] * 20])
+        binder_residues_to_keep = [i for i in range(L_complex) if binder_mask[i]]
+        for i in range(L_complex):
+            if i not in binder_residues_to_keep:
+                mask_aa[i] = torch.Tensor([1] * 20)
+                mask_aa[i][S[0][i].item()] = 1
+                
+        mask_aa = mask_aa[None].xpu()
+        
+        residues_to_keep = [i for i in range(L_receptor)]
+        protein.sys.save_selection(gti=residues_to_keep, selname='receptor')
+
+        protein.sys.save_selection(gti=binder_residues_to_keep, selname='bindermask')
+        
+        return protein, mask_aa
